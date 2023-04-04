@@ -29,6 +29,14 @@ class Timer:
         else: print(f"The query took {self.interval:.5f} {self.unit}.")
 
 
+class BlockPrint:
+    def __init__(self): pass
+
+    def __enter__(self): blockPrint(); return self
+
+    def __exit__(self, *args): enablePrint()
+
+
 def blockPrint(): sys.stdout = open(os.devnull, 'w')
 
 

@@ -1,27 +1,27 @@
+import os
 import utils
 import gym
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from keras.models import Model
-from keras.layers import Input, Dense, Conv2D, Flatten, Concatenate
-from keras.initializers.initializers_v2 import RandomUniform
+from keras.layers import Input, Dense, Conv2D, Flatten, Concatenate, BatchNormalization, Activation
+from keras.initializers.initializers_v2 import GlorotNormal
 from keras.optimizers import Adam
 from keras.callbacks import TensorBoard
 
 
 class ActionNoise:
-    def __init__(self, steering, pedals, mean=np.zeros(2, dtype=np.float32), theta=0.3, dt=5e-2, x_initial=None):
+    def __init__(self, sigma: np.ndarray, mean=np.zeros(2, dtype=np.float32), theta=0.3, dt=5e-2, x_initial=None):
         """Based on Ornstein-Uhlenbeck process"""
-        self.noise = None
-        self.y_prev = None
-        self.theta = theta
+        self.std_dev = sigma
         self.mean = mean
-        self.std_dev = np.array([steering, pedals], dtype=np.float32)
+        self.theta = theta
         self.dt = dt
         self.x_initial = x_initial
+        self.noise = self.x_initial if self.x_initial else np.zeros(2, dtype=np.float32)
         self.train = True
-        self.reset()
 
     def __call__(self) -> np.ndarray:
         """Iterate according to the Ornstein-Uhlenbeck formula"""
@@ -30,11 +30,11 @@ class ActionNoise:
             return self.noise
         else: return np.zeros(2)
 
-    def reset(self):
-        """Reset noise object to its initial state"""
-        self.noise = self.x_initial if self.x_initial is not None else np.zeros_like(self.mean)
-
-    def disable(self): self.train = False
+    def reset(self, sigma: np.ndarray, mean: np.ndarray):
+        """Reset noise object to its initial state and reassign standard deviation"""
+        self.noise = self.x_initial if self.x_initial else np.zeros_like(self.mean)
+        self.std_dev = sigma
+        self.mean = mean
 
 
 class Buffer:
@@ -78,13 +78,18 @@ class Buffer:
 
 
 class DDPG:
-    def __init__(self, env: gym.envs.registration, noise: ActionNoise, learning_rates: tuple, episodes: int, gamma: float, tau: float, saving_dir: str):
+    def __init__(self, env: gym.envs.registration, noise: ActionNoise, learning_rates: tuple,
+                 episodes: int, gamma: float, tau: float, phi: float, saving_dir: str):
         self.env = env
         self.noise = noise
         self.episodes = episodes
         self.G = gamma
         self.T = tau
+        self.PHI = phi
+
+        if not os.path.exists(saving_dir): os.mkdir(saving_dir)
         self.saving_dir = saving_dir
+        self.loading_dir = saving_dir
 
         actor_lr, critic_lr = learning_rates
         self.actor_optimizer = Adam(actor_lr)
@@ -94,7 +99,7 @@ class DDPG:
         self.action_space = 2,  # we're combining acceleration and braking into one axis
 
         # initialise the buffer
-        self.buffer = Buffer(self.state_space, self.action_space, buffer_capacity=50000, batch_size=64)
+        self.buffer = Buffer(self.state_space, self.action_space, buffer_capacity=60000, batch_size=64)
 
         # initialise the networks
         self.actor = self.actor_network()
@@ -106,34 +111,53 @@ class DDPG:
 
     def actor_network(self) -> Model:
         """Defining the actor network"""
-        # initialize small weights due to sensitive tanh activation
-        weights_init = RandomUniform(minval=-0.005, maxval=0.005)
-
         inputs = Input(shape=self.state_space, name='state_input')
-        outputs = Conv2D(filters=16, kernel_size=5, strides=4, activation='relu', use_bias=False, kernel_initializer=weights_init, name='conv2d_1')(inputs)
-        outputs = Conv2D(filters=32, kernel_size=3, strides=3, activation='relu', use_bias=False, kernel_initializer=weights_init, name='conv2d_2')(outputs)
-        outputs = Conv2D(filters=32, kernel_size=3, strides=3, activation='relu', use_bias=False, kernel_initializer=weights_init, name='conv2d_3')(outputs)
+        outputs = Conv2D(filters=32, kernel_size=8, strides=4, use_bias=False, name='conv2d_1')(inputs)
+        outputs = BatchNormalization()(outputs)
+        outputs = Activation('relu')(outputs)
+        outputs = Conv2D(filters=64, kernel_size=4, strides=3, use_bias=False, name='conv2d_2')(outputs)
+        outputs = BatchNormalization()(outputs)
+        outputs = Activation('relu')(outputs)
+        outputs = Conv2D(filters=64, kernel_size=3, strides=1, use_bias=False, name='conv2d_3')(outputs)
+        outputs = BatchNormalization()(outputs)
+        outputs = Activation('relu')(outputs)
         outputs = Flatten(name='flatten')(outputs)
-        outputs = Dense(64, activation='relu', kernel_initializer=weights_init, name='dense_1')(outputs)
+
+        outputs = Dense(512, use_bias=False, name='dense_1')(outputs)
+        outputs = BatchNormalization()(outputs)
+        outputs = Activation('relu')(outputs)
+
         # acceleration and braking are in one axis
-        outputs = Dense(2, activation='tanh', kernel_initializer=weights_init, name='next_state_output')(outputs)
+        outputs = Dense(2, kernel_initializer=GlorotNormal(), kernel_regularizer='l2', activity_regularizer='l2', use_bias=False, name='action_output')(outputs)
+        outputs = BatchNormalization()(outputs)
+        outputs = Activation('tanh')(outputs)
         model = Model(inputs, outputs, name='actor')
         return model
 
     def critic_network(self) -> Model:
         """Defining the critic network"""
         state_inputs = Input(shape=self.state_space, name='state_input')
-        state_outputs = Conv2D(filters=16, kernel_size=5, strides=4, activation='relu', use_bias=False, name='state_conv2d_1')(state_inputs)
-        state_outputs = Conv2D(filters=32, kernel_size=3, strides=3, activation='relu', use_bias=False, name='state_conv2d_2')(state_outputs)
-        state_outputs = Conv2D(filters=32, kernel_size=3, strides=3, activation='relu', use_bias=False, name='state_conv2d_3')(state_outputs)
+        state_outputs = Conv2D(filters=32, kernel_size=8, strides=4, use_bias=False, name='state_conv2d_1')(state_inputs)
+        state_outputs = BatchNormalization()(state_outputs)
+        state_outputs = Activation('relu')(state_outputs)
+        state_outputs = Conv2D(filters=64, kernel_size=4, strides=3, use_bias=False, name='state_conv2d_2')(state_outputs)
+        state_outputs = BatchNormalization()(state_outputs)
+        state_outputs = Activation('relu')(state_outputs)
+        state_outputs = Conv2D(filters=64, kernel_size=3, strides=1, use_bias=False, name='state_conv2d_3')(state_outputs)
+        state_outputs = BatchNormalization()(state_outputs)
+        state_outputs = Activation('relu')(state_outputs)
         state_outputs = Flatten(name='state_flatten')(state_outputs)
 
         action_inputs = Input(shape=2, name='action_input')
+        action_outputs = Dense(400, use_bias=False, name='action_dense_1')(action_inputs)
+        action_outputs = BatchNormalization()(action_outputs)
+        action_outputs = Activation('relu')(action_outputs)
 
-        concat = Concatenate(name='concat')([state_outputs, action_inputs])
-        outputs = Dense(64, activation='relu', name='concat_dense_1')(concat)
-        outputs = Dense(32, activation='relu', name='concat_dense_2')(outputs)
-        outputs = Dense(1, name='action_value_output')(outputs)
+        concat = Concatenate(name='concat')([state_outputs, action_outputs])
+        outputs = Dense(512, use_bias=False, kernel_initializer='zeros', name='concat_dense_1')(concat)
+        outputs = BatchNormalization()(outputs)
+        outputs = Activation('relu')(outputs)
+        outputs = Dense(1, kernel_initializer='zeros', name='action_value_output')(outputs)
 
         # Outputs single value for give state-action
         model = Model([state_inputs, action_inputs], outputs, name='critic')
@@ -165,7 +189,7 @@ class DDPG:
         train_action = tf.squeeze(self.actor(state)).numpy() + self.noise()
 
         # clip the actions, convert to a format accepted by the environment and divide by 4 to improve steering
-        env_action = np.array([train_action[0].clip(-1, 1), train_action[1].clip(0, 1), -train_action[1].clip(-1, 0)]) * 0.25
+        env_action = np.array([train_action[0].clip(-1, 1), train_action[1].clip(0, 1), -train_action[1].clip(-1, 0)]) * self.PHI
 
         return env_action, train_action
 
@@ -206,16 +230,27 @@ class DDPG:
         self.target_actor.save_weights(f"{self.saving_dir}/target_actor.h5")
         self.target_critic.save_weights(f"{self.saving_dir}/target_critic.h5")
 
+    def load_weights(self):
+        """Load the weights"""
+        self.actor.load_weights(f"{self.loading_dir}/actor.h5")
+        self.critic.load_weights(f"{self.loading_dir}/critic.h5")
+        self.target_actor.load_weights(f"{self.loading_dir}/target_actor.h5")
+        self.target_critic.load_weights(f"{self.loading_dir}/target_critic.h5")
+
+    @staticmethod
+    def save_metrics(**kwargs): pd.DataFrame(kwargs).to_csv(f"{TESTID}/metrics.csv", index=False)
+
     def main_loop(self, episodes, train=True, verbose=False):
-        reward_list = []
-        avg_reward_list = []
+        max_reward = 0
+        rewards = []
+        avg_rewards = []
+        times = []
         for e in range(episodes):
-            utils.blockPrint()
-            prev_state = self.preprocess(self.env.reset())
-            utils.enablePrint()
+            # env.reset is annoying because it prints to console, so I'm disabling print around it using system settings
+            with utils.BlockPrint(): prev_state = self.preprocess(self.env.reset())
             episodic_reward = 0
             break_counter = 0
-            with utils.Timer() as time:
+            with utils.Timer(verbose=False) as time:
                 while True:
                     if verbose: self.env.render()
                     tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state), 0)
@@ -230,20 +265,21 @@ class DDPG:
 
                     if reward < 0: break_counter += 1
                     else: break_counter = 0
-                    # terminate episode if agent earns no reward after 50 steps
-                    if done or break_counter == 50: break
+                    # terminate episode if agent earns no reward after 150 steps
+                    if done or break_counter == 150: break
                     prev_state = state
 
-            reward_list.append(episodic_reward)
-            avg_reward = np.mean(reward_list[-30:])
-            avg_reward_list.append(avg_reward)
+            rewards.append(episodic_reward)
+            avg_reward = np.mean(rewards[-50:])
             print(f"Episode {e + 1}; reward: {episodic_reward:.3f}; average reward: {avg_reward:.3f}; time: {time.getAbsoluteInterval():.3f}s")
+            if train:
+                avg_rewards.append(avg_reward)
+                times.append(time.getAbsoluteInterval())
+                if episodic_reward > max_reward:
+                    max_reward = episodic_reward
+                    self.save_weights()
 
-        if train: self.save_weights()
-        plt.plot(avg_reward_list)
-        plt.xlabel("Episode")
-        plt.ylabel("Average Reward")
-        plt.show()
+        if train: self.save_metrics(mov_avg_rewards_50=avg_rewards, rewards=rewards, times=times)
 
     def train(self, verbose=False):
         """Main function for training the agents"""
@@ -253,11 +289,11 @@ class DDPG:
 
         self.main_loop(self.episodes, train=True, verbose=verbose)
 
-    def evaluate(self, episodes, models_dir=None):
+    def evaluate(self, episodes, sigma, mean, models_dir=None):
         """Evaluate function for presentation"""
-        if models_dir: self.actor.load_weights(f"{models_dir}/actor.h5")
-
-        self.noise.disable()  # disabling noise for evaluation
+        if models_dir: self.loading_dir = models_dir
+        self.load_weights()
+        self.noise.reset(sigma=sigma, mean=mean)
         self.main_loop(episodes=episodes, train=False, verbose=True)
 
 
@@ -268,16 +304,18 @@ if __name__ == '__main__':
     # set parameters
     ACTOR_LR = 0.00001
     CRITIC_LR = 0.02
-    EPISODES = 200
+    EPISODES = 5000
     GAMMA = 0.99  # discount factor for past rewards
     TAU = 0.005  # discount factor for future rewards
-    STEERING_NOISE = 0.1  # small noise for steering
-    PEDALS_NOISE = 0.8  # big noise for acceleration and braking
-    TESTID = 'test2'
+    PHI = 0.3  # reducing severity of actor's actions
+    STD_DEV = np.array([0.1, 0.8])
+    MEAN = np.array([0.0, 0.0])
+    TESTID = 'nn_test2'
 
-    ou_noise = ActionNoise(steering=STEERING_NOISE, pedals=PEDALS_NOISE)
-    ddpg = DDPG(env, noise=ou_noise, learning_rates=(ACTOR_LR, CRITIC_LR), episodes=EPISODES, gamma=GAMMA, tau=TAU, saving_dir=TESTID)
-    ddpg.train(verbose=True)
-    ddpg.evaluate(episodes=10, models_dir='test2')
+    ou_noise = ActionNoise(sigma=STD_DEV)
+    ddpg = DDPG(env, noise=ou_noise, learning_rates=(ACTOR_LR, CRITIC_LR), episodes=EPISODES, gamma=GAMMA, tau=TAU, phi=PHI, saving_dir=TESTID)
+    ddpg.train(verbose=False)
 
-    # todo test logs of speed and braking
+    # STD_DEV = np.array([0.0, 0.08])
+    # MEAN = np.array([0.0, -0.1])
+    # ddpg.evaluate(episodes=10, sigma=STD_DEV, mean=MEAN, models_dir=TESTID)
