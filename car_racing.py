@@ -1,14 +1,15 @@
 import os
+from shutil import rmtree
 import utils
 import gym
 import numpy as np
-import pandas as pd
+from csv import writer
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from keras.models import Model
-from keras.layers import Input, Dense, Conv2D, Flatten, Concatenate, BatchNormalization, Activation
-from keras.initializers.initializers_v2 import GlorotNormal
+from keras.layers import Input, Dense, Conv2D, Flatten, Dropout, Concatenate, BatchNormalization, Activation
 from keras.optimizers import Adam
+from keras.engine.keras_tensor import KerasTensor
 from keras.callbacks import TensorBoard
 
 
@@ -89,7 +90,6 @@ class DDPG:
 
         if not os.path.exists(saving_dir): os.mkdir(saving_dir)
         self.saving_dir = saving_dir
-        self.loading_dir = saving_dir
 
         actor_lr, critic_lr = learning_rates
         self.actor_optimizer = Adam(actor_lr)
@@ -109,55 +109,60 @@ class DDPG:
         self.target_actor.set_weights(self.actor.get_weights())
         self.target_critic.set_weights(self.critic.get_weights())
 
-    def actor_network(self) -> Model:
+    @staticmethod
+    def Conv2DWithBatchNorm(filters, kernel_size, strides, name, parent: KerasTensor) -> KerasTensor:
+        """Conv2D -> BatchNorm -> ReLu"""
+        return Activation('relu')(BatchNormalization()(
+                Conv2D(filters=filters, kernel_size=kernel_size, strides=strides, activity_regularizer='l2', use_bias=False, name=name)(parent)))
+
+    @staticmethod
+    def DenseWithBatchNorm(size, name, parent: KerasTensor) -> KerasTensor:
+        """Dense -> BatchNorm -> ReLu"""
+        return Activation('relu')(BatchNormalization()(Dense(size, activity_regularizer='l2', use_bias=False, name=name)(parent)))
+
+    @staticmethod
+    def OutputWithBatchNorm(parent: KerasTensor) -> KerasTensor:
+        """Dense -> BatchNorm -> Tanh"""
+        # acceleration and braking are in one axis
+        return Activation('tanh')(BatchNormalization()(
+                Dense(2, kernel_initializer='glorot_normal', activity_regularizer='l2', use_bias=False, name='output')(parent)))
+
+    def actor_network(self, D_RATE=0.15) -> Model:
         """Defining the actor network"""
         inputs = Input(shape=self.state_space, name='state_input')
-        outputs = Conv2D(filters=32, kernel_size=8, strides=4, use_bias=False, name='conv2d_1')(inputs)
-        outputs = BatchNormalization()(outputs)
-        outputs = Activation('relu')(outputs)
-        outputs = Conv2D(filters=64, kernel_size=4, strides=3, use_bias=False, name='conv2d_2')(outputs)
-        outputs = BatchNormalization()(outputs)
-        outputs = Activation('relu')(outputs)
-        outputs = Conv2D(filters=64, kernel_size=3, strides=1, use_bias=False, name='conv2d_3')(outputs)
-        outputs = BatchNormalization()(outputs)
-        outputs = Activation('relu')(outputs)
+        outputs = self.Conv2DWithBatchNorm(filters=32, kernel_size=8, strides=4, name='conv2d_1', parent=inputs)
+        outputs = Dropout(D_RATE)(outputs)
+        outputs = self.Conv2DWithBatchNorm(filters=64, kernel_size=4, strides=3, name='conv2d_2', parent=outputs)
+        outputs = Dropout(D_RATE)(outputs)
+        outputs = self.Conv2DWithBatchNorm(filters=64, kernel_size=3, strides=1, name='conv2d_3', parent=outputs)
+        outputs = Dropout(D_RATE)(outputs)
         outputs = Flatten(name='flatten')(outputs)
-
-        outputs = Dense(512, use_bias=False, name='dense_1')(outputs)
-        outputs = BatchNormalization()(outputs)
-        outputs = Activation('relu')(outputs)
-
-        # acceleration and braking are in one axis
-        outputs = Dense(2, kernel_initializer=GlorotNormal(), kernel_regularizer='l2', activity_regularizer='l2', use_bias=False, name='action_output')(outputs)
-        outputs = BatchNormalization()(outputs)
-        outputs = Activation('tanh')(outputs)
+        outputs = self.DenseWithBatchNorm(size=512, name='dense_1', parent=outputs)
+        outputs = self.OutputWithBatchNorm(outputs)
         model = Model(inputs, outputs, name='actor')
         return model
 
-    def critic_network(self) -> Model:
+    def critic_network(self, D_RATE=0.15) -> Model:
         """Defining the critic network"""
+        # state branch
         state_inputs = Input(shape=self.state_space, name='state_input')
-        state_outputs = Conv2D(filters=32, kernel_size=8, strides=4, use_bias=False, name='state_conv2d_1')(state_inputs)
-        state_outputs = BatchNormalization()(state_outputs)
-        state_outputs = Activation('relu')(state_outputs)
-        state_outputs = Conv2D(filters=64, kernel_size=4, strides=3, use_bias=False, name='state_conv2d_2')(state_outputs)
-        state_outputs = BatchNormalization()(state_outputs)
-        state_outputs = Activation('relu')(state_outputs)
-        state_outputs = Conv2D(filters=64, kernel_size=3, strides=1, use_bias=False, name='state_conv2d_3')(state_outputs)
-        state_outputs = BatchNormalization()(state_outputs)
-        state_outputs = Activation('relu')(state_outputs)
+        state_outputs = self.Conv2DWithBatchNorm(filters=32, kernel_size=8, strides=4, name='state_conv2d_1', parent=state_inputs)
+        state_outputs = Dropout(D_RATE)(state_outputs)
+        state_outputs = self.Conv2DWithBatchNorm(filters=64, kernel_size=4, strides=3, name='state_conv2d_2', parent=state_outputs)
+        state_outputs = Dropout(D_RATE)(state_outputs)
+        state_outputs = self.Conv2DWithBatchNorm(filters=64, kernel_size=3, strides=1, name='state_conv2d_3', parent=state_outputs)
+        state_outputs = Dropout(D_RATE)(state_outputs)
         state_outputs = Flatten(name='state_flatten')(state_outputs)
 
+        # action branch
         action_inputs = Input(shape=2, name='action_input')
-        action_outputs = Dense(400, use_bias=False, name='action_dense_1')(action_inputs)
-        action_outputs = BatchNormalization()(action_outputs)
-        action_outputs = Activation('relu')(action_outputs)
+        action_outputs = self.DenseWithBatchNorm(size=400, name='action_dense_1', parent=action_inputs)
+        action_outputs = Dropout(D_RATE)(action_outputs)
 
+        # joint branch
         concat = Concatenate(name='concat')([state_outputs, action_outputs])
-        outputs = Dense(512, use_bias=False, kernel_initializer='zeros', name='concat_dense_1')(concat)
-        outputs = BatchNormalization()(outputs)
-        outputs = Activation('relu')(outputs)
-        outputs = Dense(1, kernel_initializer='zeros', name='action_value_output')(outputs)
+        outputs = self.DenseWithBatchNorm(size=512, name='concat_dense_1', parent=concat)
+        outputs = Dense(1, name='action_value_output')(outputs)
 
         # Outputs single value for give state-action
         model = Model([state_inputs, action_inputs], outputs, name='critic')
@@ -223,65 +228,80 @@ class DDPG:
         for (a, b) in zip(self.target_actor.variables, self.actor.variables): a.assign(b * self.T + a * (1 - self.T))
         for (a, b) in zip(self.target_critic.variables, self.critic.variables): a.assign(b * self.T + a * (1 - self.T))
 
-    def save_weights(self):
+    def save_weights(self, agentId=None):
         """Save the weights"""
-        self.actor.save_weights(f"{self.saving_dir}/actor.h5")
-        self.critic.save_weights(f"{self.saving_dir}/critic.h5")
-        self.target_actor.save_weights(f"{self.saving_dir}/target_actor.h5")
-        self.target_critic.save_weights(f"{self.saving_dir}/target_critic.h5")
+        if agentId is not None: path = f"{self.saving_dir}/{agentId}"; os.mkdir(path)
+        else: path = self.saving_dir
+        self.actor.save_weights(f"{path}/actor.h5")
+        self.critic.save_weights(f"{path}/critic.h5")
+        self.target_actor.save_weights(f"{path}/target_actor.h5")
+        self.target_critic.save_weights(f"{path}/target_critic.h5")
 
-    def load_weights(self):
+    def delete_weights(self, agentId): rmtree(path=f"{self.saving_dir}/{agentId}")
+
+    def load_weights(self, agentId=None):
         """Load the weights"""
-        self.actor.load_weights(f"{self.loading_dir}/actor.h5")
-        self.critic.load_weights(f"{self.loading_dir}/critic.h5")
-        self.target_actor.load_weights(f"{self.loading_dir}/target_actor.h5")
-        self.target_critic.load_weights(f"{self.loading_dir}/target_critic.h5")
+        path = f"{self.saving_dir}/{agentId}" if agentId else self.saving_dir
+        self.actor.load_weights(f"{path}/actor.h5")
+        # self.critic.load_weights(f"{path}/critic.h5")
+        # self.target_actor.load_weights(f"{path}/target_actor.h5")
+        # self.target_critic.load_weights(f"{path}/target_critic.h5")
 
-    @staticmethod
-    def save_metrics(**kwargs): pd.DataFrame(kwargs).to_csv(f"{TESTID}/metrics.csv", index=False)
+    def save_metrics(self, init=False, **kwargs):
+        with open(f"{self.saving_dir}/metrics.csv", 'a', newline='') as file:
+            if init: writer(file).writerow(kwargs.keys())
+            writer(file).writerow(kwargs.values())
 
-    def main_loop(self, episodes, train=True, verbose=False):
-        max_reward = 0
+    def main_loop(self, episodes, train=True, verbose=True):
+        avg_reward = 0
+        top_10_agents = []
         rewards = []
-        avg_rewards = []
-        times = []
-        for e in range(episodes):
+        for agentId in range(episodes):
             # env.reset is annoying because it prints to console, so I'm disabling print around it using system settings
             with utils.BlockPrint(): prev_state = self.preprocess(self.env.reset())
             episodic_reward = 0
             break_counter = 0
-            with utils.Timer(verbose=False) as time:
-                while True:
-                    if verbose: self.env.render()
-                    tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state), 0)
-                    action, train_action = self.policy(tf_prev_state)
-                    state, reward, done, info = self.env.step(action)
-                    state = self.preprocess(state)  # simplify the state image
-                    episodic_reward += reward
-                    if train:
-                        self.buffer.record((prev_state, train_action, reward, state))
-                        self.update_gradients(self.buffer.get_batches())
-                        self.update_targets()
+            step = 0
+            while True:
+                step += 1
+                if verbose: self.env.render()
+                tf_prev_state = tf.expand_dims(tf.convert_to_tensor(prev_state), 0)
+                action, train_action = self.policy(tf_prev_state)
+                state, reward, done, info = self.env.step(action)
+                state = self.preprocess(state)  # simplify the state image
+                episodic_reward += reward
+                if train:
+                    self.buffer.record((prev_state, train_action, reward, state))
+                    self.update_gradients(self.buffer.get_batches())
+                    self.update_targets()
 
-                    if reward < 0: break_counter += 1
-                    else: break_counter = 0
-                    # terminate episode if agent earns no reward after 150 steps
-                    if done or break_counter == 150: break
-                    prev_state = state
+                if reward < 0: break_counter += 1
+                else: break_counter = 0
+                # terminate episode if agent earns no reward after 150 steps
+                if done or break_counter == 150: break
+                prev_state = state
 
             rewards.append(episodic_reward)
             avg_reward = np.mean(rewards[-50:])
-            print(f"Episode {e + 1}; reward: {episodic_reward:.3f}; average reward: {avg_reward:.3f}; time: {time.getAbsoluteInterval():.3f}s")
+            print(f"Agent {agentId}; reward: {episodic_reward:.3f}; average reward: {avg_reward:.3f}; time steps: {step}")
             if train:
-                avg_rewards.append(avg_reward)
-                times.append(time.getAbsoluteInterval())
-                if episodic_reward > max_reward:
-                    max_reward = episodic_reward
-                    self.save_weights()
+                self.save_metrics(init=agentId == 0, mov_avg_rewards_50=avg_reward, rewards=episodic_reward, timesteps=step)
 
-        if train: self.save_metrics(mov_avg_rewards_50=avg_rewards, rewards=rewards, times=times)
+                # save top 10 agents for evaluation
+                # agent must have minimum 300 points to qualify for evaluation
+                if episodic_reward > 300:
+                    top_agents_rewards = np.array([rewards[i] for i in top_10_agents])
+                    if len(top_10_agents) < 10:
+                        top_10_agents.append(agentId)
+                        self.save_weights(agentId)
+                    elif episodic_reward > np.min(top_agents_rewards):
+                        dropout_agent = top_10_agents[np.argmin(top_agents_rewards)]
+                        self.delete_weights(dropout_agent)  # delete dropout agents weights
+                        top_10_agents[top_10_agents.index(dropout_agent)] = agentId
+                        self.save_weights(agentId)  # save new weights
+        if not train: return avg_reward
 
-    def train(self, verbose=False):
+    def train(self, verbose=True):
         """Main function for training the agents"""
         if verbose:
             self.actor.summary()
@@ -289,12 +309,21 @@ class DDPG:
 
         self.main_loop(self.episodes, train=True, verbose=verbose)
 
-    def evaluate(self, episodes, sigma, mean, models_dir=None):
-        """Evaluate function for presentation"""
-        if models_dir: self.loading_dir = models_dir
-        self.load_weights()
+    def evaluate(self, episodes, sigma, mean, models_dir, multiple_agents=True):
+        """Evaluate function for presentation. Supports evaluation of multiple agents"""
         self.noise.reset(sigma=sigma, mean=mean)
-        self.main_loop(episodes=episodes, train=False, verbose=True)
+        if multiple_agents:
+            agentIds = [f.path.split('\\')[1] for f in os.scandir(models_dir) if f.is_dir()]
+            for agentId in agentIds:
+                self.load_weights(agentId)
+                avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
+                print('********************************************************')
+                print(f"Average reward for agent {agentId}: {avg_reward}")
+            print('********************************************************')
+        else:
+            # this supports evaluation of older tests
+            avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
+            print(f"Average reward for agent: {avg_reward}")
 
 
 if __name__ == '__main__':
@@ -304,18 +333,23 @@ if __name__ == '__main__':
     # set parameters
     ACTOR_LR = 0.00001
     CRITIC_LR = 0.02
-    EPISODES = 5000
+    EPISODES = 1500
     GAMMA = 0.99  # discount factor for past rewards
     TAU = 0.005  # discount factor for future rewards
-    PHI = 0.3  # reducing severity of actor's actions
+    PHI = 0.25  # reducing severity of actor's actions
     STD_DEV = np.array([0.1, 0.8])
     MEAN = np.array([0.0, 0.0])
-    TESTID = 'nn_test2'
+    TESTID = 'nn_test5'
 
-    ou_noise = ActionNoise(sigma=STD_DEV)
+    ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
     ddpg = DDPG(env, noise=ou_noise, learning_rates=(ACTOR_LR, CRITIC_LR), episodes=EPISODES, gamma=GAMMA, tau=TAU, phi=PHI, saving_dir=TESTID)
-    ddpg.train(verbose=False)
+    ddpg.train(verbose=True)
 
-    # STD_DEV = np.array([0.0, 0.08])
-    # MEAN = np.array([0.0, -0.1])
-    # ddpg.evaluate(episodes=10, sigma=STD_DEV, mean=MEAN, models_dir=TESTID)
+    STD_DEV = np.array([0.0, 0.08])
+    MEAN = np.array([0.0, -0.1])
+    ddpg.evaluate(episodes=10, sigma=STD_DEV, mean=MEAN, models_dir=TESTID)
+
+    # TODO TEST:
+    #  get loss metric
+    #  kernel vs activity regularizer
+    #  test batchnorm before and after activation
