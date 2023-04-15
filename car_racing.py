@@ -5,9 +5,11 @@ import gym
 import numpy as np
 from csv import writer
 import tensorflow as tf
+import matplotlib.pyplot as plt
 from keras.models import Model
 from keras.layers import Input, Dense, Conv2D, Flatten, Dropout, Concatenate, BatchNormalization
 from keras.optimizers import Adam
+from keras.optimizers.schedules.learning_rate_schedule import *
 
 
 class ActionNoise:
@@ -91,7 +93,7 @@ class DDPG:
         self.actorAdam = Adam(learning_rate=actorLR, clipnorm=gradClip)
         self.criticAdam = Adam(learning_rate=criticLR, clipnorm=gradClip)
 
-        self.stateSpace = env.observation_space.shape
+        self.stateSpace = 96, 96, 3
         self.actionSpace = 2,  # we're combining acceleration and braking into one axis
 
         # create a directory for models
@@ -162,8 +164,8 @@ class DDPG:
         outputs = Dense(128, activation='relu', activity_regularizer='l2')(outputs)
         outputs = BatchNormalization()(outputs)
         outputs = Dropout(self.D_RATE)(outputs)
-        outputs = Dense(128, activation='relu', activity_regularizer='l2')(outputs)
-        outputs = Dense(1, name='action_value_output')(outputs)
+        outputs = Dense(128, activation='relu', activity_regularizer='l2', use_bias=False)(outputs)
+        outputs = Dense(1, name='action_value_output', use_bias=False)(outputs)
 
         # outputs single value for state-action
         model = Model([state_inputs, action_inputs], outputs, name='critic')
@@ -187,6 +189,10 @@ class DDPG:
         # scale
         processed_state /= np.max(processed_state)
 
+        # process to grayscale
+        # processed_state = np.dot(processed_state[..., :3], [0.2989, 0.5870, 0.1140])
+        # processed_state = np.expand_dims(processed_state, axis=2)
+
         return processed_state
 
     def policy(self, state) -> tuple[np.ndarray, np.ndarray]:
@@ -201,7 +207,7 @@ class DDPG:
         return env_action, train_action
 
     @tf.function
-    def update_gradients(self, batches: tf.tuple) -> tuple:
+    def update_gradients(self, batches: tf.tuple):
         """Training and updating the networks"""
         state_batch, action_batch, reward_batch, next_state_batch = batches
 
@@ -223,8 +229,6 @@ class DDPG:
 
         actor_grad = tape.gradient(actor_loss, self.actor.trainable_variables)
         self.actorAdam.apply_gradients(zip(actor_grad, self.actor.trainable_variables))
-
-        return -actor_loss, critic_loss
 
     @tf.function
     def update_targets(self):
@@ -265,26 +269,18 @@ class DDPG:
             # env.reset is annoying because it prints to console, so I'm disabling print around it using system settings
             with utils.BlockPrint(): prevState = self.preprocess(self.env.reset())
             # init variables
-            epReward, breakCounter, episodicStep, epActorLoss, epCriticLoss = 0, 0, 0, 0, 0
+            epReward, breakCounter, episodicStep = 0, 0, 0
             while True:
-                envStep += 1  # update the step counters
                 episodicStep += 1
                 if verbose: self.env.render()
                 action, trainAction = self.policy(tf.expand_dims(tf.convert_to_tensor(prevState), 0))  # get new action based on a current state
                 state, reward, done, info = self.env.step(action)  # perform an action
-                print(info)
                 state = self.preprocess(state)  # simplify the state image
                 epReward += reward  # append the reward
                 if train:
                     self.buffer.record((prevState, trainAction, reward, state))  # save the transition in the buffer
-                    losses = self.update_gradients(self.buffer.get_batches())  # update gradients
+                    self.update_gradients(self.buffer.get_batches())  # update gradients
                     self.update_targets()  # update targets
-                    epActorLoss += losses[0].numpy()  # append losses
-                    epCriticLoss += losses[1].numpy()
-                    # write losses to the logs
-                    with self.logger.as_default():
-                        tf.summary.scalar(name="ActorLossByEnvStep", data=losses[0].numpy(), step=envStep)
-                        tf.summary.scalar(name="CriticLossByEnvStep", data=losses[1].numpy(), step=envStep)
 
                 # increment the break counter if there was no reward and reset if there was
                 if reward < 0: breakCounter += 1
@@ -293,27 +289,23 @@ class DDPG:
                 if done or breakCounter == 150: break
                 prevState = state
 
-            epActorLoss /= episodicStep  # get episodic loss means
-            epCriticLoss /= episodicStep
+            envStep += episodicStep
             rewards.append(epReward)
             avgReward = np.mean(rewards[-50:])
-            print(f"Episode {ep}; reward: {epReward:.3f}; average reward: {avgReward:.3f}; "
-                  f"actor loss: {epActorLoss:.3f}; critic loss: {epCriticLoss:.3f}; time steps: {episodicStep}")
+            print(f"Episode {ep}; reward: {epReward:.3f}; average reward: {avgReward:.3f}; time steps: {episodicStep}")
             if train:
                 # write metrics into a csv file
-                self.save_metrics(init=ep == 0, mov_avg_rewards_50=avgReward, rewards=epReward,
-                                  actor_losses=epActorLoss, critic_losses=epCriticLoss, timesteps=episodicStep)
+                self.save_metrics(init=ep == 0, mov_avg_rewards_50=avgReward, rewards=epReward, timesteps=episodicStep)
 
                 # write logs
                 with self.logger.as_default():
                     tf.summary.scalar(name="50AvgReward", data=avgReward, step=ep)
                     tf.summary.scalar(name="Reward", data=epReward, step=ep)
-                    tf.summary.scalar(name="ActorLossByEpisode", data=epActorLoss, step=ep)
-                    tf.summary.scalar(name="CriticLossByEpisode", data=epCriticLoss, step=ep)
+                    tf.summary.scalar(name="TimeSteps", data=episodicStep, step=ep)
+                    tf.summary.scalar(name="TimeStepsTotal", data=envStep, step=ep)
 
-                # TODO EVALUATE BASED ON THE ACTOR LOSS
-                # save top 10 agents for evaluation
-                # agent must have minimum 600 points to qualify for evaluation
+                # save top 10 best scoring models for evaluation
+                # model must have minimum 600 points to qualify for evaluation
                 if epReward > 600:
                     bestModelsRewards = np.array([rewards[i] for i in top10Models])
                     if len(top10Models) < 10:
@@ -342,8 +334,9 @@ class DDPG:
             modelIds = [f.path.split('\\')[1] for f in os.scandir(models_dir) if f.is_dir()]
             for modelId in modelIds:
                 self.load_weights(modelId)
+                print(f"\nEVALUATING MODEL {modelId}")
                 avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
-                print(f"\nAVERAGE REWARD FOR MODEL {modelId}: {avg_reward}\n")
+                print(f"AVERAGE REWARD FOR MODEL {modelId}: {avg_reward}\n")
         else:
             # this supports evaluation of older tests
             self.load_weights(modelId)
@@ -356,28 +349,24 @@ if __name__ == '__main__':
     env = gym.make("CarRacing-v0")
 
     # set parameters
-    ACTOR_LR = 0.00001
-    CRITIC_LR = 0.02
-    EPISODES = 500
+    EPISODES = 1250
+    ACTOR_LR = ExponentialDecay(initial_learning_rate=2e-5, decay_steps=1000, decay_rate=0.95)
+    CRITIC_LR = ExponentialDecay(initial_learning_rate=4e-2, decay_steps=1000, decay_rate=0.95)
     GAMMA = 0.99  # discount factor for past rewards
     TAU = 0.005  # discount factor for future rewards
     PHI = np.array([0.25, 0.25])  # reducing severity of actor's actions
     STD_DEV = np.array([0.1, 0.8])
     MEAN = np.array([0.0, -0.05])
-    DROPOUT = 0.15
-    GRADCLIP = 1.0
-    TESTID = 'nn_test8'
+    DROPOUT = 0.2
+    GRADCLIP = 1
+    TESTID = 'nn_test19'
 
     ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
-    ddpg = DDPG(env, noise=ou_noise, lr=(ACTOR_LR, CRITIC_LR), gradClip=GRADCLIP, episodes=EPISODES, gamma=GAMMA, tau=TAU, phi=PHI, dropout=DROPOUT, runId=TESTID)
-    ddpg.train(verbose=True)
+    ddpg = DDPG(env, noise=ou_noise, lr=(ACTOR_LR, CRITIC_LR), gradClip=GRADCLIP, episodes=EPISODES,
+                gamma=GAMMA, tau=TAU, phi=PHI, dropout=DROPOUT, runId=TESTID)
+    ddpg.train(verbose=False)
 
-    STD_DEV = np.array([0.0, 0.08])
-    MEAN = np.array([0.0, -0.15])
-    ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
-    ddpg.evaluate(episodes=10, noise=ou_noise, models_dir=TESTID)
-
-    # TODO
-    #  dropout layers in the critic
-    #  do sth with the loss
-    #  grayscale
+    # STD_DEV = np.array([0.0, 0.2])
+    # MEAN = np.array([0.0, -0.2])
+    # ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
+    # ddpg.evaluate(episodes=10, noise=ou_noise, models_dir=TESTID)
