@@ -5,11 +5,11 @@ import gym
 import numpy as np
 from csv import writer
 import tensorflow as tf
-import matplotlib.pyplot as plt
 from keras.models import Model
 from keras.layers import Input, Dense, Conv2D, Flatten, Dropout, Concatenate, BatchNormalization
 from keras.optimizers import Adam
-from keras.optimizers.schedules.learning_rate_schedule import *
+from keras.optimizers.schedules.learning_rate_schedule import ExponentialDecay
+from keras.utils import plot_model
 
 
 class ActionNoise:
@@ -29,12 +29,6 @@ class ActionNoise:
             self.noise = self.noise + self.theta * (self.mean - self.noise) * self.dt + self.std_dev * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
             return self.noise
         else: return np.zeros(2)
-
-    def reset(self, sigma: np.ndarray, mean: np.ndarray):
-        """Reset noise object to its initial state and reassign standard deviation TODO could be unnecessary"""
-        self.noise = self.x_initial if self.x_initial else np.zeros_like(self.mean)
-        self.std_dev = sigma
-        self.mean = mean
 
 
 class Buffer:
@@ -78,8 +72,8 @@ class Buffer:
 
 
 class DDPG:
-    def __init__(self, env: gym.envs.registration, noise: ActionNoise,
-                 episodes, lr, gradClip, gamma, tau, phi, dropout, runId):
+    def __init__(self, env: gym.envs.registration, noise: ActionNoise, episodes,
+                 lr, gradClip, gamma, tau, phi, dropout, breakCount, runId, initModelPath=None):
         # initialise params
         self.env = env
         self.noise = noise
@@ -88,6 +82,7 @@ class DDPG:
         self.T = tau
         self.PHI = phi
         self.D_RATE = dropout
+        self.BREAK = breakCount
 
         actorLR, criticLR = lr
         self.actorAdam = Adam(learning_rate=actorLR, clipnorm=gradClip)
@@ -112,8 +107,11 @@ class DDPG:
         self.critic = self.critic_network()
         self.targetActor = self.actor_network()
         self.targetCritic = self.critic_network()
-        self.targetActor.set_weights(self.actor.get_weights())
-        self.targetCritic.set_weights(self.critic.get_weights())
+        if initModelPath is not None:
+            self.load_weights(modelPath=initModelPath)
+        else:
+            self.targetActor.set_weights(self.actor.get_weights())
+            self.targetCritic.set_weights(self.critic.get_weights())
 
     def actor_network(self) -> Model:
         """Defining the actor network"""
@@ -135,6 +133,7 @@ class DDPG:
         outputs = BatchNormalization()(outputs)
         outputs = Dense(2, activation='tanh', kernel_initializer='glorot_normal', activity_regularizer='l2', use_bias=False, name='output')(outputs)
         model = Model(inputs, outputs, name='actor')
+        # plot_model(model, to_file='actor.png')
         return model
 
     def critic_network(self) -> Model:
@@ -169,6 +168,7 @@ class DDPG:
 
         # outputs single value for state-action
         model = Model([state_inputs, action_inputs], outputs, name='critic')
+        # plot_model(model, to_file='critic.png')
         return model
 
     @staticmethod
@@ -188,10 +188,6 @@ class DDPG:
 
         # scale
         processed_state /= np.max(processed_state)
-
-        # process to grayscale
-        # processed_state = np.dot(processed_state[..., :3], [0.2989, 0.5870, 0.1140])
-        # processed_state = np.expand_dims(processed_state, axis=2)
 
         return processed_state
 
@@ -247,13 +243,13 @@ class DDPG:
 
     def delete_weights(self, agentId): rmtree(path=f"{self.savingDir}/{agentId}")
 
-    def load_weights(self, agentId=None):
+    def load_weights(self, modelPath=None, modelId=None):
         """Load the weights"""
-        path = f"{self.savingDir}/{agentId}" if agentId else self.savingDir
+        path = modelPath if modelPath else f"{self.savingDir}/{modelId}" if modelId else self.savingDir
         self.actor.load_weights(f"{path}/actor.h5")
-        # self.critic.load_weights(f"{path}/critic.h5")
-        # self.target_actor.load_weights(f"{path}/target_actor.h5")
-        # self.target_critic.load_weights(f"{path}/target_critic.h5")
+        self.critic.load_weights(f"{path}/critic.h5")
+        self.targetActor.load_weights(f"{path}/target_actor.h5")
+        self.targetCritic.load_weights(f"{path}/target_critic.h5")
 
     def save_metrics(self, init=False, **kwargs):
         with open(f"{self.savingDir}/metrics.csv", 'a', newline='') as file:
@@ -285,28 +281,29 @@ class DDPG:
                 # increment the break counter if there was no reward and reset if there was
                 if reward < 0: breakCounter += 1
                 else: breakCounter = 0
-                # terminate episode if agent earns no reward after 150 steps
-                if done or breakCounter == 150: break
+                # terminate episode if agent earns no reward after n steps
+                if done or breakCounter == self.BREAK: break
                 prevState = state
 
             envStep += episodicStep
             rewards.append(epReward)
             avgReward = np.mean(rewards[-50:])
+
+            # write logs
             print(f"Episode {ep}; reward: {epReward:.3f}; average reward: {avgReward:.3f}; time steps: {episodicStep}")
+            with self.logger.as_default():
+                tf.summary.scalar(name="50AvgReward", data=avgReward, step=ep)
+                tf.summary.scalar(name="Reward", data=epReward, step=ep)
+                tf.summary.scalar(name="TimeSteps", data=episodicStep, step=ep)
+                tf.summary.scalar(name="TimeStepsTotal", data=envStep, step=ep)
+
             if train:
                 # write metrics into a csv file
                 self.save_metrics(init=ep == 0, mov_avg_rewards_50=avgReward, rewards=epReward, timesteps=episodicStep)
 
-                # write logs
-                with self.logger.as_default():
-                    tf.summary.scalar(name="50AvgReward", data=avgReward, step=ep)
-                    tf.summary.scalar(name="Reward", data=epReward, step=ep)
-                    tf.summary.scalar(name="TimeSteps", data=episodicStep, step=ep)
-                    tf.summary.scalar(name="TimeStepsTotal", data=envStep, step=ep)
-
                 # save top 10 best scoring models for evaluation
-                # model must have minimum 600 points to qualify for evaluation
-                if epReward > 600:
+                # model must have minimum 700 points to qualify for evaluation
+                if epReward > 700:
                     bestModelsRewards = np.array([rewards[i] for i in top10Models])
                     if len(top10Models) < 10:
                         top10Models.append(ep)
@@ -327,19 +324,20 @@ class DDPG:
 
         self.main_loop(self.episodes, train=True, verbose=verbose)
 
-    def evaluate(self, episodes, noise: ActionNoise, models_dir, multiple_agents=True, modelId=None):
+    def evaluate(self, episodes, noise: ActionNoise, breakCount, modelsDir=None, modelPath=None):
         """Evaluate function for presentation. Supports evaluation of multiple agents"""
         self.noise = noise
-        if multiple_agents:
-            modelIds = [f.path.split('\\')[1] for f in os.scandir(models_dir) if f.is_dir()]
+        self.BREAK = breakCount
+        if modelsDir is not None:
+            modelIds = [f.path.split('\\')[1] for f in os.scandir(modelsDir) if f.is_dir()]
             for modelId in modelIds:
-                self.load_weights(modelId)
+                self.load_weights(modelId=modelId)
                 print(f"\nEVALUATING MODEL {modelId}")
                 avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
                 print(f"AVERAGE REWARD FOR MODEL {modelId}: {avg_reward}\n")
-        else:
+        elif modelPath is not None:
             # this supports evaluation of older tests
-            self.load_weights(modelId)
+            self.load_weights(modelPath=modelPath)
             avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
             print(f"Average reward for agent: {avg_reward}")
 
@@ -349,24 +347,28 @@ if __name__ == '__main__':
     env = gym.make("CarRacing-v0")
 
     # set parameters
-    EPISODES = 1250
-    ACTOR_LR = ExponentialDecay(initial_learning_rate=2e-5, decay_steps=1000, decay_rate=0.95)
-    CRITIC_LR = ExponentialDecay(initial_learning_rate=4e-2, decay_steps=1000, decay_rate=0.95)
+    EPISODES = 400
+    ACTOR_LR = ExponentialDecay(initial_learning_rate=2e-5, decay_steps=1000, decay_rate=0.96)
+    CRITIC_LR = ExponentialDecay(initial_learning_rate=4e-2, decay_steps=1000, decay_rate=0.96)
     GAMMA = 0.99  # discount factor for past rewards
     TAU = 0.005  # discount factor for future rewards
-    PHI = np.array([0.25, 0.25])  # reducing severity of actor's actions
-    STD_DEV = np.array([0.1, 0.8])
+    PHI = np.array([0.25, 0.3])  # reducing severity of actor's actions
+    STD_DEV = np.array([0.01, 0.08])
     MEAN = np.array([0.0, -0.05])
     DROPOUT = 0.2
     GRADCLIP = 1
-    TESTID = 'nn_test19'
+    BREAK_COUNT = 150  # terminating the episode
+    # MODELPATH = 'final_models/342'
+    TESTID = 'eval'
 
     ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
     ddpg = DDPG(env, noise=ou_noise, lr=(ACTOR_LR, CRITIC_LR), gradClip=GRADCLIP, episodes=EPISODES,
-                gamma=GAMMA, tau=TAU, phi=PHI, dropout=DROPOUT, runId=TESTID)
-    ddpg.train(verbose=False)
+                gamma=GAMMA, tau=TAU, phi=PHI, dropout=DROPOUT, breakCount=BREAK_COUNT, runId=TESTID)
+    ddpg.train(verbose=True)
 
-    # STD_DEV = np.array([0.0, 0.2])
-    # MEAN = np.array([0.0, -0.2])
-    # ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
-    # ddpg.evaluate(episodes=10, noise=ou_noise, models_dir=TESTID)
+    BREAK_COUNT = 35
+    MODELPATH = 'final_models/342'
+    STD_DEV = np.array([0.0, 0.0])
+    MEAN = np.array([0.0, -0.15])
+    ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
+    ddpg.evaluate(episodes=100, noise=ou_noise, breakCount=BREAK_COUNT, modelPath=MODELPATH)
