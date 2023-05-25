@@ -173,20 +173,21 @@ class DDPG:
 
     @staticmethod
     def preprocess(state: np.ndarray) -> np.ndarray:
+        """Preprocessing the state representation image"""
         processed_state = np.array(state, copy=True, dtype=np.float32)
 
-        # process the speed bar
+        # enlarge the speed bar
         for i in range(88, 94): processed_state[i, 0:12, :] = processed_state[i, 12, :]
 
-        # process grass colour
+        # unify grass colour
         # from [102, 229, 102] to [102, 204, 102]
         processed_state[:, :, 1][processed_state[:, :, 1] == 229] = 204
 
-        # process track colour
+        # unify track colour
         # from [102, 105, 102] and [102, 107, 102] to [102, 102, 102]
         processed_state[:, :, 1][(processed_state[:, :, 1] == 105) | (processed_state[:, :, 1] == 107)] = 102
 
-        # scale
+        # normalise
         processed_state /= np.max(processed_state)
 
         return processed_state
@@ -251,11 +252,6 @@ class DDPG:
         self.targetActor.load_weights(f"{path}/target_actor.h5")
         self.targetCritic.load_weights(f"{path}/target_critic.h5")
 
-    def save_metrics(self, init=False, **kwargs):
-        with open(f"{self.savingDir}/metrics.csv", 'a', newline='') as file:
-            if init: writer(file).writerow(kwargs.keys())
-            writer(file).writerow(kwargs.values())
-
     def main_loop(self, episodes, train=True, verbose=True):
         avgReward = 0
         envStep = 0
@@ -298,11 +294,9 @@ class DDPG:
                 tf.summary.scalar(name="TimeStepsTotal", data=envStep, step=ep)
 
             if train:
-                # write metrics into a csv file
-                self.save_metrics(init=ep == 0, mov_avg_rewards_50=avgReward, rewards=epReward, timesteps=episodicStep)
-
                 # save top 10 best scoring models for evaluation
                 # model must have minimum 700 points to qualify for evaluation
+                # logic below overwrites the lowest-scoring model if there are more 10 models saved
                 if epReward > 700:
                     bestModelsRewards = np.array([rewards[i] for i in top10Models])
                     if len(top10Models) < 10:
@@ -336,7 +330,7 @@ class DDPG:
                 avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
                 print(f"AVERAGE REWARD FOR MODEL {modelId}: {avg_reward}\n")
         elif modelPath is not None:
-            # this supports evaluation of older tests
+            # this supports evaluation of singular models
             self.load_weights(modelPath=modelPath)
             avg_reward = self.main_loop(episodes=episodes, train=False, verbose=True)
             print(f"Average reward for agent: {avg_reward}")
@@ -353,22 +347,22 @@ if __name__ == '__main__':
     GAMMA = 0.99  # discount factor for past rewards
     TAU = 0.005  # discount factor for future rewards
     PHI = np.array([0.25, 0.3])  # reducing severity of actor's actions
-    STD_DEV = np.array([0.01, 0.08])
+    STD_DEV = np.array([0.1, 0.8])  # high noise guarantees exploration
     MEAN = np.array([0.0, -0.05])
     DROPOUT = 0.2
     GRADCLIP = 1
-    BREAK_COUNT = 150  # terminating the episode
-    # MODELPATH = 'final_models/342'
+    BREAK_COUNT = 150  # terminating the episode after steps without reward
+    # MODELPATH = 'final_model'
     TESTID = 'eval'
 
     ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
     ddpg = DDPG(env, noise=ou_noise, lr=(ACTOR_LR, CRITIC_LR), gradClip=GRADCLIP, episodes=EPISODES,
                 gamma=GAMMA, tau=TAU, phi=PHI, dropout=DROPOUT, breakCount=BREAK_COUNT, runId=TESTID)
-    ddpg.train(verbose=True)
+    # ddpg.train(verbose=True)  # comment this line when just running evaluation
 
     BREAK_COUNT = 35
-    MODELPATH = 'final_models/342'
-    STD_DEV = np.array([0.0, 0.0])
-    MEAN = np.array([0.0, -0.15])
+    MODELPATH = 'final_model'  # model dir name
+    STD_DEV = np.array([0.0, 0.0])  # removing noise for evaluation
+    MEAN = np.array([0.0, -0.05])  # leaving the speed factor of the mean to prevent model from dealing with the speed it's not used to
     ou_noise = ActionNoise(sigma=STD_DEV, mean=MEAN)
     ddpg.evaluate(episodes=100, noise=ou_noise, breakCount=BREAK_COUNT, modelPath=MODELPATH)
